@@ -39,12 +39,13 @@ var replayCmd = &cobra.Command{
 }
 
 var (
-	replayFile         string
-	replayDryRun       bool
-	replaySpeed        float64
-	replayTimeout      time.Duration
-	replayNodePool     string
-	replayNodePoolName string
+	replayFile           string
+	replayDryRun         bool
+	replaySpeed          float64
+	replayTimeout        time.Duration
+	replayNodePool       string
+	replayNodePoolName   string
+	replayPreserveShaping bool
 )
 
 func init() {
@@ -54,6 +55,11 @@ func init() {
 	replayCmd.Flags().DurationVar(&replayTimeout, "timeout", 10*time.Minute, "Max time to wait for stabilization (0 to disable)")
 	replayCmd.Flags().StringVar(&replayNodePool, "nodepool", "", "Taint key on target nodes (e.g. kaas.acquia.io/kubereplay). Injects NoSchedule toleration into all workloads.")
 	replayCmd.Flags().StringVar(&replayNodePoolName, "nodepool-name", "", "karpenter.sh/nodepool nodeSelector value. Defaults to --nodepool when not set. Use when SimplePool taint key differs from pool name.")
+	replayCmd.Flags().BoolVar(&replayPreserveShaping, "preserve-shaping", false,
+		"Preserve kaas.acquia.io/shape nodeAffinity/nodeSelector in pod specs. "+
+			"Default (false): strips shaping constraints so pods schedule on any node. "+
+			"true: keeps shaping constraints so pods only schedule on shape-matched nodes. "+
+			"Use for shaping in/out comparison tests.")
 }
 
 func runReplay(cmd *cobra.Command, args []string) error {
@@ -90,7 +96,7 @@ func runReplay(cmd *cobra.Command, args []string) error {
 
 	// Dry-run mode: simulate timing without creating workloads
 	if replayDryRun {
-		engine := replay.NewEngine(nil, sanitizer.Namespace)
+		engine := replay.NewEngineWithShaping(nil, sanitizer.Namespace, replayPreserveShaping)
 		engine.NodePool = replayNodePool
 		engine.NodePoolName = replayNodePoolName
 		_, err := engine.RunTimed(ctx, replayLog, replaySpeed, true)
@@ -109,7 +115,7 @@ func runReplay(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	engine := replay.NewEngine(kubeClient, sanitizer.Namespace)
+	engine := replay.NewEngineWithShaping(kubeClient, sanitizer.Namespace, replayPreserveShaping)
 	engine.NodePool = replayNodePool
 	engine.NodePoolName = replayNodePoolName
 

@@ -37,14 +37,21 @@ type Sanitizer struct {
 	// Empty string = default behaviour (deployment-N, job-N).
 	// "snap" = snap-deployment-N, snap-job-N.
 	prefix string
+	// preserveShaping keeps kaas.acquia.io/* nodeAffinity/nodeSelector keys in pod specs.
+	// Default (false): strips these keys so pods schedule on any kwok node.
+	// true: keeps them so pods only schedule on nodes with matching shape labels.
+	// Used for shaping in/out comparison tests.
+	preserveShaping bool
 	// keyMapping tracks original key -> sanitized key for scale event correlation
 	keyMapping map[string]string
 }
 
 // New creates a new workload sanitizer with default naming (deployment-N, job-N)
+// and default behavior (strips kaas.acquia.io/* shaping constraints)
 func New() *Sanitizer {
 	return &Sanitizer{
-		keyMapping: make(map[string]string),
+		keyMapping:      make(map[string]string),
+		preserveShaping: false,
 	}
 }
 
@@ -53,8 +60,20 @@ func New() *Sanitizer {
 // when the two are merged: snap-deployment-0 vs deployment-0.
 func NewWithPrefix(prefix string) *Sanitizer {
 	return &Sanitizer{
-		prefix:     prefix,
-		keyMapping: make(map[string]string),
+		prefix:          prefix,
+		keyMapping:      make(map[string]string),
+		preserveShaping: false,
+	}
+}
+
+// NewWithShaping creates a sanitizer that preserves kaas.acquia.io/* shaping
+// constraints in pod specs. Use for shaping in/out comparison tests.
+// Test A (with shaping):    NewWithShaping(true)
+// Test B (without shaping): NewWithShaping(false)
+func NewWithShaping(preserveShaping bool) *Sanitizer {
+	return &Sanitizer{
+		keyMapping:      make(map[string]string),
+		preserveShaping: preserveShaping,
 	}
 }
 
@@ -109,7 +128,7 @@ func (s *Sanitizer) SanitizeDeployment(deployment *appsv1.Deployment) *appsv1.De
 	}
 
 	// Sanitize pod template
-	newDeploy.Spec.Template = sanitizePodTemplateSpec(newDeploy.Spec.Template, appLabel, false)
+	newDeploy.Spec.Template = s.sanitizePodTemplateSpec(newDeploy.Spec.Template, appLabel, false)
 
 	// Clear status
 	newDeploy.Status = appsv1.DeploymentStatus{}
@@ -151,7 +170,7 @@ func (s *Sanitizer) SanitizeJob(job *batchv1.Job) *batchv1.Job {
 	newJob.Spec.Selector = nil
 
 	// Sanitize pod template (forJob=true so containers exit)
-	newJob.Spec.Template = sanitizePodTemplateSpec(newJob.Spec.Template, appLabel, true)
+	newJob.Spec.Template = s.sanitizePodTemplateSpec(newJob.Spec.Template, appLabel, true)
 
 	// Clear TTL (we manage cleanup)
 	newJob.Spec.TTLSecondsAfterFinished = nil
@@ -175,7 +194,7 @@ func clearObjectMeta(meta *metav1.ObjectMeta) {
 	meta.GenerateName = ""
 }
 
-func sanitizePodTemplateSpec(template corev1.PodTemplateSpec, appLabel string, forJob bool) corev1.PodTemplateSpec {
+func (s *Sanitizer) sanitizePodTemplateSpec(template corev1.PodTemplateSpec, appLabel string, forJob bool) corev1.PodTemplateSpec {
 	// Clear auto-generated labels (Job controller labels, etc.) and set fresh ones
 	// We keep Karpenter labels if any
 	karpenterLabels := lo.PickBy(template.Labels, func(v string, k string) bool {
@@ -222,13 +241,15 @@ func sanitizePodTemplateSpec(template corev1.PodTemplateSpec, appLabel string, f
 	// Strip cluster-specific node selectors that only exist on real EKS/kaas nodes.
 	// These would keep pods Pending forever on a kwok cluster.
 	// We keep only generic kubernetes.io/* and karpenter.sh/* selectors.
-	template.Spec.NodeSelector = filterPortableNodeSelector(template.Spec.NodeSelector)
+	// When preserveShaping=true, kaas.acquia.io/shape keys are also kept.
+	template.Spec.NodeSelector = s.filterPortableNodeSelectorWithShaping(template.Spec.NodeSelector)
 
 	// Sanitize nodeAffinity: strip expressions that would prevent scheduling on
 	// Karpenter nodes. On the replay cluster ALL nodes are Karpenter-provisioned,
 	// so rules like "karpenter.sh/nodepool DoesNotExist" (placed on non-Karpenter
 	// nodes in prod) would keep every pod Pending forever.
-	template.Spec.Affinity = filterPortableAffinity(template.Spec.Affinity)
+	// When preserveShaping=true, kaas.acquia.io/shape matchExpressions are kept.
+	template.Spec.Affinity = s.filterPortableAffinityWithShaping(template.Spec.Affinity)
 
 	// Strip cluster-specific tolerations (kaas.acquia.io/*, node-role.kaas.acquia.io/*).
 	// Keep standard kubernetes.io tolerations and karpenter.sh tolerations.
@@ -287,17 +308,39 @@ func isPortableKey(key string) bool {
 	return false
 }
 
-// filterPortableAffinity removes nodeAffinity expressions that would prevent
-// pods from scheduling on Karpenter-managed nodes in the replay cluster.
-//
-// Specifically it strips matchExpressions with operator=DoesNotExist on
-// karpenter.sh/* keys. In prod these are used to pin workloads to non-Karpenter
-// (static) nodes. On the replay cluster every node is Karpenter-managed, so
-// such rules make pods unschedulable.
-//
-// Pod affinity/anti-affinity and topology spread constraints are kept — they
-// are meaningful for Karpenter bin-packing simulation.
-func filterPortableAffinity(affinity *corev1.Affinity) *corev1.Affinity {
+// isPortableKeyWithShaping is like isPortableKey but also allows kaas.acquia.io/shape
+// keys when preserveShaping=true. Used for shaping in/out comparison tests.
+func (s *Sanitizer) isPortableKey(key string, preserveShaping bool) bool {
+	// If preserving shaping, also allow kaas.acquia.io/shape keys
+	if preserveShaping && strings.HasPrefix(key, "kaas.acquia.io/shape") {
+		return true
+	}
+	return isPortableKey(key)
+}
+
+// filterPortableNodeSelectorWithShaping filters nodeSelector using the sanitizer's
+// preserveShaping setting. When preserveShaping=true, kaas.acquia.io/shape keys
+// are kept so pods retain their shape constraints during replay.
+func (s *Sanitizer) filterPortableNodeSelectorWithShaping(ns map[string]string) map[string]string {
+	if len(ns) == 0 {
+		return nil
+	}
+	out := make(map[string]string)
+	for k, v := range ns {
+		if s.isPortableKey(k, s.preserveShaping) {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// filterPortableAffinityWithShaping filters nodeAffinity using the sanitizer's
+// preserveShaping setting. When preserveShaping=true, kaas.acquia.io/shape
+// matchExpressions are kept so pods retain their shape constraints during replay.
+func (s *Sanitizer) filterPortableAffinityWithShaping(affinity *corev1.Affinity) *corev1.Affinity {
 	if affinity == nil {
 		return nil
 	}
@@ -310,7 +353,7 @@ func filterPortableAffinity(affinity *corev1.Affinity) *corev1.Affinity {
 	if na.RequiredDuringSchedulingIgnoredDuringExecution != nil {
 		var keepTerms []corev1.NodeSelectorTerm
 		for _, term := range na.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
-			filtered := filterNodeSelectorTerm(term)
+			filtered := s.filterNodeSelectorTermWithShaping(term)
 			// Only keep the term if it still has expressions after filtering;
 			// an empty term would match any node which changes semantics.
 			if len(filtered.MatchExpressions) > 0 || len(filtered.MatchFields) > 0 {
@@ -318,17 +361,15 @@ func filterPortableAffinity(affinity *corev1.Affinity) *corev1.Affinity {
 			}
 		}
 		if len(keepTerms) == 0 {
-			// All terms were anti-karpenter rules — drop the required affinity entirely
 			na.RequiredDuringSchedulingIgnoredDuringExecution = nil
 		} else {
 			na.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms = keepTerms
 		}
 	}
 
-	// Filter preferred terms too
 	var keepPreferred []corev1.PreferredSchedulingTerm
 	for _, pref := range na.PreferredDuringSchedulingIgnoredDuringExecution {
-		filtered := filterNodeSelectorTerm(pref.Preference)
+		filtered := s.filterNodeSelectorTermWithShaping(pref.Preference)
 		if len(filtered.MatchExpressions) > 0 || len(filtered.MatchFields) > 0 {
 			keepPreferred = append(keepPreferred, corev1.PreferredSchedulingTerm{
 				Weight:     pref.Weight,
@@ -341,9 +382,9 @@ func filterPortableAffinity(affinity *corev1.Affinity) *corev1.Affinity {
 	return result
 }
 
-// filterNodeSelectorTerm removes matchExpressions that use DoesNotExist on
-// karpenter.sh/* keys — these block scheduling on Karpenter nodes.
-func filterNodeSelectorTerm(term corev1.NodeSelectorTerm) corev1.NodeSelectorTerm {
+// filterNodeSelectorTermWithShaping filters a NodeSelectorTerm using the
+// sanitizer's preserveShaping setting.
+func (s *Sanitizer) filterNodeSelectorTermWithShaping(term corev1.NodeSelectorTerm) corev1.NodeSelectorTerm {
 	var keep []corev1.NodeSelectorRequirement
 	for _, expr := range term.MatchExpressions {
 		// Strip: karpenter.sh/* with DoesNotExist — anti-karpenter node rules
@@ -351,8 +392,8 @@ func filterNodeSelectorTerm(term corev1.NodeSelectorTerm) corev1.NodeSelectorTer
 			expr.Operator == corev1.NodeSelectorOpDoesNotExist {
 			continue
 		}
-		// Strip: kaas.acquia.io/* and node-role.kaas.acquia.io/* — cluster-specific
-		if !isPortableKey(expr.Key) {
+		// Strip: kaas.acquia.io/* unless preserveShaping and it's a shape key
+		if !s.isPortableKey(expr.Key, s.preserveShaping) {
 			continue
 		}
 		keep = append(keep, expr)

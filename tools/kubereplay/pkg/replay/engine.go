@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/aws/karpenter-provider-aws/tools/kubereplay/pkg/format"
+	"github.com/aws/karpenter-provider-aws/tools/kubereplay/pkg/sanitizer"
 )
 
 // Engine orchestrates workload replay against a target cluster
@@ -47,6 +48,9 @@ type Engine struct {
 	NodePoolName string
 	// deploymentNames maps original key to replayed deployment name
 	deploymentNames map[string]string
+	// sanitizer handles pod spec sanitization - strips or preserves shaping
+	// based on preserveShaping setting (used for shaping in/out tests)
+	sanitizer *sanitizer.Sanitizer
 }
 
 // NewEngine creates a new replay engine
@@ -56,7 +60,17 @@ func NewEngine(kubeClient client.Client, namespace string) *Engine {
 		namespace:       namespace,
 		speed:           1.0,
 		deploymentNames: make(map[string]string),
+		sanitizer:       sanitizer.New(), // default: strips shaping constraints
 	}
+}
+
+// NewEngineWithShaping creates a replay engine with optional shaping preservation.
+// preserveShaping=true:  keeps kaas.acquia.io/shape nodeAffinity on pods (Test A)
+// preserveShaping=false: strips shaping constraints (Test B)
+func NewEngineWithShaping(kubeClient client.Client, namespace string, preserveShaping bool) *Engine {
+	e := NewEngine(kubeClient, namespace)
+	e.sanitizer = sanitizer.NewWithShaping(preserveShaping)
+	return e
 }
 
 // injectNodePool adds a toleration and nodeSelector for the target NodePool to a

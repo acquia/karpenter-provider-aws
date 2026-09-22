@@ -333,50 +333,6 @@ func (e *Engine) deleteDeployment(ctx context.Context, originalKey string) (stri
 	return deployName, nil
 }
 
-// EnsureNamespace ensures the target namespace exists and is ready.
-// If the namespace is terminating, it waits for deletion to complete before recreating.
-func (e *Engine) EnsureNamespace(ctx context.Context) error {
-	ns := &corev1.Namespace{}
-	err := e.kubeClient.Get(ctx, client.ObjectKey{Name: e.namespace}, ns)
-	if err != nil && !errors.IsNotFound(err) {
-		return fmt.Errorf("failed to check namespace: %w", err)
-	}
-
-	// If namespace exists and is terminating, wait for it to be deleted
-	if err == nil && ns.Status.Phase == corev1.NamespaceTerminating {
-		fmt.Printf("Waiting for namespace %s to finish terminating...\n", e.namespace)
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(time.Second):
-			}
-
-			err := e.kubeClient.Get(ctx, client.ObjectKey{Name: e.namespace}, ns)
-			if errors.IsNotFound(err) {
-				break
-			}
-			if err != nil {
-				return fmt.Errorf("failed to check namespace: %w", err)
-			}
-		}
-	}
-
-	// Create the namespace if it doesn't exist
-	if errors.IsNotFound(err) || ns.Status.Phase == corev1.NamespaceTerminating {
-		ns = &corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: e.namespace,
-			},
-		}
-		if err := e.kubeClient.Create(ctx, ns); err != nil && !errors.IsAlreadyExists(err) {
-			return fmt.Errorf("failed to create namespace: %w", err)
-		}
-	}
-
-	return nil
-}
-
 // createPDBForDeployment creates a PodDisruptionBudget for a deployment
 func (e *Engine) createPDBForDeployment(ctx context.Context, deployment *appsv1.Deployment) error {
 	maxUnavailable := intstr.FromString("50%")
@@ -582,4 +538,56 @@ func (e *Engine) getStatus(ctx context.Context) (Status, error) {
 
 func formatOffset(d time.Duration) string {
 	return "+" + d.Truncate(time.Second).String()
+}
+
+// EnsureNamespace ensures the target namespace exists and is ready.
+// If the namespace is terminating, it waits for deletion to complete before recreating.
+func (e *Engine) EnsureNamespace(ctx context.Context) error {
+	ns := &corev1.Namespace{}
+	err := e.kubeClient.Get(ctx, client.ObjectKey{Name: e.namespace}, ns)
+	if err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to check namespace: %w", err)
+	}
+
+	// If namespace exists and is terminating, wait for it to be deleted
+	if err == nil && ns.Status.Phase == corev1.NamespaceTerminating {
+		fmt.Printf("Waiting for namespace %s to finish terminating...\n", e.namespace)
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Second):
+			}
+
+			err := e.kubeClient.Get(ctx, client.ObjectKey{Name: e.namespace}, ns)
+			if errors.IsNotFound(err) {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("failed to check namespace: %w", err)
+			}
+		}
+	}
+
+	// Create the namespace if it doesn't exist
+	if errors.IsNotFound(err) || ns.Status.Phase == corev1.NamespaceTerminating {
+		ns = &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: e.namespace,
+				Labels: map[string]string{
+					"acquia.io/pci":      "false",
+					"acquia.io/consumer": "KCC",
+					"acquia.io/owner":    "KCC",
+					"acquia.io/fedramp":  "false",
+					"acquia.io/stage":    "dev",
+					"acquia.io/bu":       "dc",
+				},
+			},
+		}
+		if err := e.kubeClient.Create(ctx, ns); err != nil && !errors.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to create namespace: %w", err)
+		}
+	}
+
+	return nil
 }

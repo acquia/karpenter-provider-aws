@@ -23,6 +23,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 )
 
+
 // EventType represents the type of workload event
 type EventType string
 

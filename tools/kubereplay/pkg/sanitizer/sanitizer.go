@@ -259,18 +259,20 @@ func (s *Sanitizer) sanitizePodTemplateSpec(template corev1.PodTemplateSpec, app
 }
 
 // portableSelectorPrefixes are the only nodeSelector key prefixes we keep.
-// Everything else (kaas.acquia.io/*, node-role.kaas.acquia.io/*, etc.) is
-// cluster-specific and will prevent scheduling on kwok/non-prod nodes.
+// Everything else (kaas.acquia.io/shape, topology.kubernetes.io/zone, etc.) is
+// stripped — shape labels don't exist on kwok nodes, and zone names don't match.
 // topology.kubernetes.io/zone is excluded intentionally: kwok uses synthetic
-// zone names (test-zone-a/b/c/d) that don't match real AWS zones, so zone
-// nodeSelectors would keep pods Pending. Zone topology spread constraints
-// (in topologySpreadConstraints) are kept — Karpenter handles those.
+// zone names (test-zone-a/b/c/d) that don't match real AWS zones.
+// kaas.acquia.io/pool and node-role.kaas.acquia.io/* ARE kept — the KWOK NodePools
+// carry the same taints/labels as prod so pool routing works identically.
 var portableSelectorPrefixes = []string{
 	"kubernetes.io/",
 	"karpenter.sh/",
 	"karpenter.k8s.aws/",
 	"node.kubernetes.io/",
 	"beta.kubernetes.io/",
+	"kaas.acquia.io/pool",
+	"node-role.kaas.acquia.io/",
 }
 
 func filterPortableNodeSelector(ns map[string]string) map[string]string {

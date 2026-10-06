@@ -235,6 +235,25 @@ func (e *Engine) createDeployment(ctx context.Context, deployment *appsv1.Deploy
 	return deployCopy.Name, nil
 }
 
+// createDaemonSet applies a DaemonSet from the velero snapshot baseline.
+// The pod spec has already been sanitized by velero-snapshot.py (prod nodeSelectors
+// stripped, kubereplay toleration injected).  We inject the NodePool toleration here
+// too so pods land only on the isolated replay pool.
+func (e *Engine) createDaemonSet(ctx context.Context, ds *appsv1.DaemonSet) (string, error) {
+	dsCopy := ds.DeepCopy()
+	dsCopy.Namespace = e.namespace
+	dsCopy.ResourceVersion = ""
+	dsCopy.UID = ""
+
+	e.injectNodePool(&dsCopy.Spec.Template.Spec)
+
+	err := e.kubeClient.Create(ctx, dsCopy)
+	if err != nil && errors.IsAlreadyExists(err) {
+		return dsCopy.Name, nil
+	}
+	return dsCopy.Name, err
+}
+
 func (e *Engine) createJob(ctx context.Context, event *format.WorkloadEvent) (string, error) {
 	jobCopy := event.Job.DeepCopy()
 	jobCopy.Namespace = e.namespace
@@ -504,7 +523,7 @@ func (e *Engine) getStatus(ctx context.Context) (Status, error) {
 		return j.Status.Succeeded > 0 || j.Status.CompletionTime != nil
 	})
 
-	// Get pod status
+	// Get pod status — includes pods from Deployments, Jobs, and DaemonSets
 	var pods corev1.PodList
 	if err := e.kubeClient.List(ctx, &pods,
 		client.InNamespace(e.namespace),
